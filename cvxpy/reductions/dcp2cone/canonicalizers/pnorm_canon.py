@@ -45,15 +45,10 @@ def pnorm_canon(expr, args, solver_context: SolverInfo | None = None):
         else:
             return t, [SOC(vec(t, order='F'), x, axis)]
 
-    # Check if user requested power cones (approx=False)
-    use_powcone = False
-    if not expr._approx:
-        solver_supports_powcone = (
-            solver_context is not None
-            and PowCone3D in solver_context.solver_supported_constraints
-        )
-        if solver_supports_powcone:
-            use_powcone = True
+    # If user requested power cones (approx=False), always use PowCone3D.
+    # The solving chain will add appropriate reductions or raise an error
+    # if power cones are not supported.
+    use_powcone = not expr._approx
 
     # we need an absolute value constraint for the symmetric convex branches
     # (p > 1)
@@ -110,7 +105,7 @@ def pnorm_canon(expr, args, solver_context: SolverInfo | None = None):
             solver_context is not None
             and PowCone3D in solver_context.solver_supported_constraints
         )
-        if solver_supports_powcone and expr._approx:
+        if solver_supports_powcone:
             approx_error = getattr(expr, 'approx_error', 0.0)
             num_soc = len([c for c in constraints if isinstance(c, SOC)])
             if approx_error > 1e-6 or num_soc > 4:

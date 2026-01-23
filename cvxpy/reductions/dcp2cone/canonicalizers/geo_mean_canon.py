@@ -36,18 +36,15 @@ def geo_mean_canon(expr, args, solver_context: SolverInfo | None = None):
     else:
         x_list = [x[i] for i in range(len(w))]
 
-    # Check if user requested power cones (approx=False)
+    # If user requested power cones (approx=False), always use PowConeND.
+    # The solving chain will add Exotic2Common if the solver needs PowCone3D,
+    # or raise an error if power cones are not supported at all.
     if not expr._approx:
-        solver_supports_powcone = (
-            solver_context is not None
-            and PowConeND in solver_context.solver_supported_constraints
-        )
-        if solver_supports_powcone:
-            # Use PowConeND: prod(W^alpha) >= |z|
-            # Stack x_list into a column vector W
-            W = vstack(x_list)
-            alpha = np.array([float(wi) for wi in w]).reshape(-1, 1)
-            return t, [PowConeND(W, t, alpha, axis=0)]
+        # Use PowConeND: prod(W^alpha) >= |z|
+        # Stack x_list into a column vector W
+        W = vstack(x_list)
+        alpha = np.array([float(wi) for wi in w]).reshape(-1, 1)
+        return t, [PowConeND(W, t, alpha, axis=0)]
 
     # Use SOC approximation
     constrs = gm_constrs(t, x_list, w)
@@ -57,7 +54,7 @@ def geo_mean_canon(expr, args, solver_context: SolverInfo | None = None):
         solver_context is not None
         and PowConeND in solver_context.solver_supported_constraints
     )
-    if solver_supports_powcone and expr._approx:
+    if solver_supports_powcone:
         approx_error = getattr(expr, 'approx_error', 0.0)
         num_soc = len(constrs)
         if approx_error > 1e-6 or num_soc > 4:
