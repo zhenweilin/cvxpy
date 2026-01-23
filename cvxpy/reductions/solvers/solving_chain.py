@@ -6,20 +6,16 @@ import numpy as np
 import scipy.sparse as sp
 
 import cvxpy.settings as s
-from cvxpy.atoms import PSD_ATOMS
+from cvxpy.atoms import PSD_ATOMS, SOC_ATOMS
 from cvxpy.constraints import (
     PSD,
     SOC,
     Equality,
     FiniteSet,
-    Inequality,
-    NonNeg,
-    NonPos,
     PowCone3D,
     PowConeND,
     Zero,
 )
-from cvxpy.constraints.exponential import OpRelEntrConeQuad, RelEntrConeQuad
 from cvxpy.error import DCPError, DGPError, DPPError, SolverError
 from cvxpy.problems.objective import Maximize
 from cvxpy.reductions.chain import Chain
@@ -45,6 +41,40 @@ from cvxpy.settings import CLARABEL, COO_CANON_BACKEND, DPP_PARAM_THRESHOLD
 from cvxpy.utilities import scopes
 from cvxpy.utilities.debug_tools import build_non_disciplined_error_msg
 from cvxpy.utilities.solver_context import SolverInfo
+
+
+def _collect_atom_instances(problem):
+    """Collect all atom instances from a problem's expressions.
+
+    Unlike problem.atoms() which returns classes, this returns actual instances.
+    """
+    from cvxpy.atoms.atom import Atom
+
+    instances = []
+    seen = set()  # Track by id to avoid duplicates
+
+    def traverse(expr):
+        expr_id = id(expr)
+        if expr_id in seen:
+            return
+        seen.add(expr_id)
+
+        if isinstance(expr, Atom):
+            instances.append(expr)
+
+        if hasattr(expr, 'args'):
+            for arg in expr.args:
+                traverse(arg)
+
+    # Traverse objective
+    traverse(problem.objective.expr)
+
+    # Traverse constraints
+    for c in problem.constraints:
+        for arg in c.args:
+            traverse(arg)
+
+    return instances
 
 DPP_ERROR_MSG = (
     "You are solving a parameterized problem that is not DPP. "
@@ -258,8 +288,8 @@ def construct_solving_chain(problem, candidates,
     # Conclude with matrix stuffing; choose one of the following paths:
     #   (1) ConeMatrixStuffing(quad_obj=True) --> [a QpSolver],
     #   (2) ConeMatrixStuffing --> [a ConicSolver]
-    use_quad = True if solver_opts is None else solver_opts.get('use_quad_obj', True)
-    if _solve_as_qp(problem, candidates, ignore_dpp) and use_quad:
+    use_quad_obj = True if solver_opts is None else solver_opts.get('use_quad_obj', True)
+    if _solve_as_qp(problem, candidates, ignore_dpp) and use_quad_obj:
         # Route to a QP solver via the conic canonicalization path
         solver = candidates['qp_solvers'][0]
         solver_instance = slv_def.SOLVER_MAP_QP[solver]
@@ -277,16 +307,8 @@ def construct_solving_chain(problem, candidates,
                           "conic solvers exist among candidate solvers "
                           "(%s)." % candidates)
 
-    # Determine quad_obj setting for Dcp2Cone
-    use_quad_obj = True if solver_opts is None else solver_opts.get("use_quad_obj", True)
-
-    # Collect some basic info about the problem constraints
-    constr_types = set()
-    for c in problem.constraints:
-        constr_types.add(type(c))
-    approx_cos = [ct for ct in constr_types if ct in APPROX_CONES]
-
     # Disregard Clarabel for SDP if configured
+    constr_types = {type(c) for c in problem.constraints}
     atoms = problem.atoms()
     if any(atom in PSD_ATOMS for atom in atoms) \
             or any(v.is_psd() or v.is_nsd() for v in problem.variables()) \
@@ -295,143 +317,125 @@ def construct_solving_chain(problem, candidates,
                 and specified_solver is None:
             candidates['conic_solvers'] = [s for s in candidates['conic_solvers'] if s != CLARABEL]
 
-    # Apply Dcp2Cone to discover actual cone constraints.
-    # We use quad_obj=False for discovery since we want to see the full cone structure.
-    # Later we'll apply the correct quad_obj setting based on the chosen solver.
-    # Include QuadApprox if we have approximation cones that need it.
-    temp_reductions = list(reductions)
-    if approx_cos:
-        temp_reductions.append(QuadApprox())
-    temp_reductions.append(Dcp2Cone(quad_obj=False))
-    canonicalized = problem
-    for r in temp_reductions:
-        canonicalized, _ = r.apply(canonicalized)
+    # Detect power cones from:
+    # 1. Existing power cone constraints in the problem
+    # 2. Atoms with approx=False that will produce power cones during canonicalization
+    has_pow_nd = PowConeND in constr_types
+    has_pow_3d = PowCone3D in constr_types
+    atom_instances = _collect_atom_instances(problem)
+    for atom in atom_instances:
+        if getattr(atom, '_approx', True):
+            continue  # Using SOC approximation, no power cones
+        # Check atom type to determine which power cone it produces
+        atom_name = type(atom).__name__
+        if atom_name == 'geo_mean':
+            has_pow_nd = True
+        elif atom_name in ('power', 'Pnorm'):
+            has_pow_3d = True
 
-    # Inspect actual constraint types after canonicalization
-    actual_cones = {type(c) for c in canonicalized.constraints}
+    # Check for QuadApprox cones
+    has_approx_cones = bool(constr_types & APPROX_CONES.keys())
 
-    # Map constraint types to their canonical cone forms.
-    # Inequality, NonPos, and NonNeg all map to NonNeg cone.
-    # Equality and Zero both map to Zero cone.
-    mapped_cones = set()
-    for cone in actual_cones:
-        if cone in (Inequality, NonPos, NonNeg):
-            mapped_cones.add(NonNeg)
-        elif cone in (Equality, Zero):
-            mapped_cones.add(Zero)
-        else:
-            mapped_cones.add(cone)
-    actual_cones = mapped_cones
+    # Detect SOC cones (for SOC2PSD fallback with solvers like SDPA)
+    has_soc = SOC in constr_types or any(atom in SOC_ATOMS for atom in atoms)
 
-    # Check for has_constr
-    var_domains = sum([var.domain for var in problem.variables()], start=[])
-    has_constr = len(actual_cones) > 0 or len(problem.constraints) > 0 or len(var_domains) > 0
+    # Check if problem has constraints (including those that will be generated by atoms)
+    # Atoms canonicalize to constraints during Dcp2Cone, so if there are any
+    # non-affine atoms, the canonicalized problem will have constraints.
+    has_constr = (
+        problem.constraints
+        or any(var.domain for var in problem.variables())
+        or len(atom_instances) > 0  # Atoms will generate constraints
+    )
 
+    # Cache mixed-integer check
+    is_mi = problem.is_mixed_integer()
+
+    # Try each solver to find one that can handle the problem
     for solver in candidates['conic_solvers']:
         solver_instance = slv_def.SOLVER_MAP_CONIC[solver]
-        # Cones supported for MI problems may differ from non MI.
-        if problem.is_mixed_integer():
-            supported_constraints = solver_instance.MI_SUPPORTED_CONSTRAINTS
-        else:
-            supported_constraints = solver_instance.SUPPORTED_CONSTRAINTS
+        supported = (
+            solver_instance.MI_SUPPORTED_CONSTRAINTS if is_mi
+            else solver_instance.SUPPORTED_CONSTRAINTS
+        )
 
-        solver_context = SolverInfo(solver=solver, supported_constraints=supported_constraints)
+        if not has_constr and solver_instance.REQUIRES_CONSTR:
+            continue
 
-        # Determine what cone-to-cone reductions are needed based on actual constraints
-        # Case 1: PowConeND present, solver supports PowCone3D but not PowConeND
+        # Determine what Exotic2Common reductions are needed for power cones
         needs_pownd_to_pow3d = (
-            PowConeND in actual_cones and
-            PowConeND not in supported_constraints and
-            PowCone3D in supported_constraints
+            has_pow_nd and
+            PowConeND not in supported and
+            PowCone3D in supported
         )
-
-        # Case 2: Power cones present but solver doesn't support any power cones
-        # In this case, we convert PowCone3D to SOC via Exotic2Common
         needs_pow3d_to_soc = (
-            (PowCone3D in actual_cones or PowConeND in actual_cones) and
-            PowCone3D not in supported_constraints and
-            PowConeND not in supported_constraints and
-            SOC in supported_constraints
+            (has_pow_3d or has_pow_nd) and
+            PowCone3D not in supported and
+            PowConeND not in supported and
+            SOC in supported
         )
 
-        # Compute effective cones after potential Exotic2Common reductions
-        effective_cones = actual_cones.copy()
-        if needs_pownd_to_pow3d:
-            effective_cones.discard(PowConeND)
-            effective_cones.add(PowCone3D)
+        # Skip solver if it can't handle power cones and we can't convert them
+        if (has_pow_nd or has_pow_3d) and not (
+            PowConeND in supported or
+            PowCone3D in supported or
+            needs_pow3d_to_soc
+        ):
+            continue
+
+        # Check if SOC2PSD conversion is needed (e.g., for SDPA which only supports PSD)
+        needs_soc2psd = has_soc and SOC not in supported and PSD in supported
+
+        # Skip solver if it can't handle SOC cones
+        if has_soc and SOC not in supported and not needs_soc2psd:
+            continue
+
+        # Found a viable solver - build the chain
+        solver_context = SolverInfo(solver=solver, supported_constraints=supported)
+
+        # Add QuadApprox if needed
+        if has_approx_cones:
+            reductions.append(QuadApprox())
+
+        # Add Dcp2Cone with correct settings for this solver
+        quad_obj = (use_quad_obj and solver_instance.supports_quad_obj() and
+                    problem.objective.expr.has_quadratic_term())
+        reductions.append(Dcp2Cone(quad_obj=quad_obj, solver_context=solver_context))
+
+        # Add CvxAttr2Constr
+        reductions.append(CvxAttr2Constr(reduce_bounds=not solver_instance.BOUNDED_VARIABLES))
+
+        # Add Exotic2Common if needed for power cone conversions
         if needs_pow3d_to_soc:
-            # Both PowConeND and PowCone3D get converted to SOC
-            effective_cones.discard(PowConeND)
-            effective_cones.discard(PowCone3D)
-            effective_cones.add(SOC)
+            if has_pow_nd:
+                # PowConeND → PowCone3D → SOC requires two passes
+                reductions.append(Exotic2Common())
+                reductions.append(Exotic2Common())
+            else:
+                # PowCone3D → SOC requires one pass
+                reductions.append(Exotic2Common())
+        elif needs_pownd_to_pow3d:
+            # PowConeND → PowCone3D
+            reductions.append(Exotic2Common())
 
-        # Check if all cones are supported
-        unsupported_cones = [c for c in effective_cones if c not in supported_constraints]
+        # Add SOCDim3 if needed
+        if solver_instance.SOC_DIM3_ONLY:
+            reductions.append(SOCDim3())
 
-        if has_constr or not solver_instance.REQUIRES_CONSTR:
-            # Check if we can support all cones (possibly with additional reductions)
-            can_solve = len(unsupported_cones) == 0
-            needs_soc2psd = False
+        # Add SOC2PSD if needed (e.g., for SDPA)
+        if needs_soc2psd:
+            reductions.append(SOC2PSD())
 
-            if not can_solve:
-                # Check if SOC2PSD would help
-                if all(c == SOC for c in unsupported_cones) and PSD in supported_constraints:
-                    can_solve = True
-                    needs_soc2psd = True
+        # Add final reductions
+        reductions.append(ConeMatrixStuffing(quad_obj=quad_obj, canon_backend=canon_backend))
+        reductions.append(solver_instance)
 
-            if can_solve:
-                # Build the actual reduction chain
-                solver_reductions = list(reductions)
+        return SolvingChain(reductions=reductions, solver_context=solver_context)
 
-                # Add QuadApprox if needed
-                if RelEntrConeQuad in approx_cos or OpRelEntrConeQuad in approx_cos:
-                    solver_reductions.append(QuadApprox())
-
-                # Determine quad_obj for this solver
-                quad_obj = use_quad_obj and solver_instance.supports_quad_obj() and \
-                    problem.objective.expr.has_quadratic_term()
-
-                # Add Dcp2Cone with proper solver context
-                solver_reductions.append(
-                    Dcp2Cone(quad_obj=quad_obj, solver_context=solver_context)
-                )
-
-                # Add CvxAttr2Constr
-                solver_reductions.append(
-                    CvxAttr2Constr(reduce_bounds=not solver_instance.BOUNDED_VARIABLES)
-                )
-
-                # Add Exotic2Common if needed
-                # Note: If we need PowConeND → SOC, we need two passes:
-                # First pass converts PowConeND → PowCone3D
-                # Second pass converts PowCone3D → SOC
-                if needs_pownd_to_pow3d or needs_pow3d_to_soc:
-                    solver_reductions.append(Exotic2Common())
-                if needs_pow3d_to_soc and PowConeND in actual_cones:
-                    # Need second pass for PowCone3D → SOC after PowConeND → PowCone3D
-                    solver_reductions.append(Exotic2Common())
-
-                # Add SOC2PSD if needed
-                if needs_soc2psd:
-                    solver_reductions.append(SOC2PSD())
-
-                # Add SOCDim3 if needed
-                if solver_instance.SOC_DIM3_ONLY and SOC in effective_cones:
-                    solver_reductions.append(SOCDim3())
-
-                # Add final reductions
-                solver_reductions += [
-                    ConeMatrixStuffing(quad_obj=quad_obj, canon_backend=canon_backend),
-                    solver_instance
-                ]
-                return SolvingChain(reductions=solver_reductions, solver_context=solver_context)
-
-    # Build error message with actual cones
+    # No solver found
     raise SolverError("Either candidate conic solvers (%s) do not support the "
-                      "cones output by the problem (%s), or there are not "
-                      "enough constraints in the problem." % (
-                          candidates['conic_solvers'],
-                          ", ".join([cone.__name__ for cone in actual_cones])))
+                      "cones output by the problem, or there are not "
+                      "enough constraints in the problem." % candidates['conic_solvers'])
 
 
 def _validate_problem_data(data) -> None:
