@@ -338,28 +338,32 @@ def construct_solving_chain(problem, candidates,
         solver_context = SolverInfo(solver=solver, supported_constraints=supported_constraints)
 
         # Determine what cone-to-cone reductions are needed based on actual constraints
-        needs_exotic2common = (
+        # Case 1: PowConeND present, solver supports PowCone3D but not PowConeND
+        needs_pownd_to_pow3d = (
             PowConeND in actual_cones and
             PowConeND not in supported_constraints and
             PowCone3D in supported_constraints
         )
 
-        # Check if power cones are unsupported entirely
-        power_cones_unsupported = (
+        # Case 2: Power cones present but solver doesn't support any power cones
+        # In this case, we convert PowCone3D to SOC via Exotic2Common
+        needs_pow3d_to_soc = (
             (PowCone3D in actual_cones or PowConeND in actual_cones) and
             PowCone3D not in supported_constraints and
-            PowConeND not in supported_constraints
+            PowConeND not in supported_constraints and
+            SOC in supported_constraints
         )
 
-        if power_cones_unsupported:
-            # Skip this solver - can't handle power cones
-            continue
-
-        # Compute effective cones after potential Exotic2Common reduction
+        # Compute effective cones after potential Exotic2Common reductions
         effective_cones = actual_cones.copy()
-        if needs_exotic2common:
+        if needs_pownd_to_pow3d:
             effective_cones.discard(PowConeND)
             effective_cones.add(PowCone3D)
+        if needs_pow3d_to_soc:
+            # Both PowConeND and PowCone3D get converted to SOC
+            effective_cones.discard(PowConeND)
+            effective_cones.discard(PowCone3D)
+            effective_cones.add(SOC)
 
         # Check if all cones are supported
         unsupported_cones = [c for c in effective_cones if c not in supported_constraints]
@@ -398,7 +402,13 @@ def construct_solving_chain(problem, candidates,
                 )
 
                 # Add Exotic2Common if needed
-                if needs_exotic2common:
+                # Note: If we need PowConeND → SOC, we need two passes:
+                # First pass converts PowConeND → PowCone3D
+                # Second pass converts PowCone3D → SOC
+                if needs_pownd_to_pow3d or needs_pow3d_to_soc:
+                    solver_reductions.append(Exotic2Common())
+                if needs_pow3d_to_soc and PowConeND in actual_cones:
+                    # Need second pass for PowCone3D → SOC after PowConeND → PowCone3D
                     solver_reductions.append(Exotic2Common())
 
                 # Add SOC2PSD if needed

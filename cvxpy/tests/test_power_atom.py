@@ -480,3 +480,125 @@ class TestPnormApprox(BaseTest):
             ]
             self.assertEqual(len(pnorm_warnings), 0,
                              "Should not warn when using power cones")
+
+
+class TestExotic2CommonPowerCones(BaseTest):
+    """Tests for power cone conversions in Exotic2Common."""
+
+    def test_pow3d_to_soc_conversion(self) -> None:
+        """Test that pow_3d_canon correctly converts PowCone3D to SOC."""
+        from cvxpy.constraints.power import PowCone3D
+        from cvxpy.constraints.second_order import SOC
+        from cvxpy.reductions.cone2cone.exotic2common import pow_3d_canon
+
+        x = cp.Variable(pos=True)
+        y = cp.Variable(pos=True)
+        z = cp.Variable()
+
+        # Create PowCone3D constraint: x^0.5 * y^0.5 >= |z|
+        con = PowCone3D(x, y, z, 0.5)
+        canon_constr, aux_constrs = pow_3d_canon(con, [x, y, z])
+
+        # Result should be SOC constraint (first one), and aux_constrs are the rest
+        self.assertIsInstance(canon_constr, SOC)
+        # All constraints (canon + aux) should be SOC
+        all_constrs = [canon_constr] + aux_constrs
+        for c in all_constrs:
+            self.assertIsInstance(c, SOC)
+
+    def test_pow3d_to_soc_vector_case(self) -> None:
+        """Test PowCone3D to SOC conversion with vector variables."""
+        from cvxpy.constraints.power import PowCone3D
+        from cvxpy.constraints.second_order import SOC
+        from cvxpy.reductions.cone2cone.exotic2common import pow_3d_canon
+
+        x = cp.Variable(3, pos=True)
+        y = cp.Variable(3, pos=True)
+        z = cp.Variable(3)
+
+        con = PowCone3D(x, y, z, 0.5)
+        canon_constr, aux_constrs = pow_3d_canon(con, [x, y, z])
+
+        # Result should be SOC constraint (first one), and aux_constrs are the rest
+        self.assertIsInstance(canon_constr, SOC)
+        # All constraints (canon + aux) should be SOC
+        all_constrs = [canon_constr] + aux_constrs
+        self.assertGreater(len(all_constrs), 0)
+        for c in all_constrs:
+            self.assertIsInstance(c, SOC)
+
+    def test_mixed_pownd_pow3d_with_scs(self) -> None:
+        """Test problem with both PowConeND and PowCone3D works with SCS.
+
+        SCS supports PowCone3D but not PowConeND. This test verifies that:
+        1. geo_mean(approx=False) produces PowConeND
+        2. power(approx=False) produces PowCone3D
+        3. Exotic2Common converts PowConeND -> PowCone3D
+        4. The resulting problem with only PowCone3D can be solved by SCS
+        """
+        # geo_mean produces PowConeND
+        x = cp.Variable(3, pos=True)
+        gm = cp.geo_mean(x, approx=False)
+
+        # power produces PowCone3D
+        y = cp.Variable(pos=True)
+        pw = cp.power(y, 0.5, approx=False)
+
+        # Create a problem using both
+        prob = cp.Problem(
+            cp.Maximize(gm + pw),
+            [cp.sum(x) <= 3, y <= 4]
+        )
+
+        # Solve with SCS (supports PowCone3D but not PowConeND)
+        result = prob.solve(solver=cp.SCS, eps=1e-5)
+
+        # Verify solution
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(x.value, [1, 1, 1], rtol=1e-2)
+        np.testing.assert_allclose(y.value, 4.0, rtol=1e-2)
+
+    def test_exotic2common_preserves_pow3d_for_capable_solver(self) -> None:
+        """Test that Exotic2Common only converts what's needed.
+
+        For SCS (PowCone3D supported, PowConeND not supported):
+        - PowConeND should be converted to PowCone3D
+        - Original PowCone3D should remain as PowCone3D (not converted to SOC)
+        """
+
+        # Create a problem with just PowCone3D (from power atom)
+        x = cp.Variable(pos=True)
+        prob = cp.Problem(
+            cp.Maximize(cp.power(x, 0.5, approx=False)),
+            [x <= 4]
+        )
+
+        # Get problem data for SCS
+        data, _, _ = prob.get_problem_data(cp.SCS)
+
+        # Should have power cones, not just SOC
+        dims = data['dims']
+        self.assertGreater(len(dims.p3d), 0,
+                           "SCS should use PowCone3D, not convert to SOC")
+
+    def test_geo_mean_approx_false_with_scs_uses_exotic2common(self) -> None:
+        """Test that geo_mean(approx=False) works with SCS via Exotic2Common."""
+        x = cp.Variable(3, pos=True)
+        prob = cp.Problem(
+            cp.Maximize(cp.geo_mean(x, approx=False)),
+            [cp.sum(x) <= 3]
+        )
+
+        prob.solve(solver=cp.SCS, eps=1e-5)
+        np.testing.assert_allclose(x.value, [1, 1, 1], rtol=1e-2)
+
+    def test_pnorm_approx_false_with_scs(self) -> None:
+        """Test that pnorm(approx=False) works with SCS."""
+        x = cp.Variable(3)
+        prob = cp.Problem(
+            cp.Minimize(cp.pnorm(x, p=3, approx=False)),
+            [cp.sum(x) == 3, x >= 0]
+        )
+
+        prob.solve(solver=cp.SCS, eps=1e-5)
+        np.testing.assert_allclose(x.value, [1, 1, 1], rtol=1e-2)

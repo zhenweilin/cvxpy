@@ -220,7 +220,11 @@ class Pnorm(AxisAtom):
         return False
 
     def get_data(self):
-        return [self.p, self.axis, self._approx]
+        # Return all constructor parameters (after x) in order:
+        # p, axis, keepdims, max_denom, approx
+        # Note: max_denom is not stored, but using default 1024 works because
+        # self.p is already approximated and pow_* functions are idempotent for Fractions
+        return [self.p, self.axis, self.keepdims, 1024, self._approx]
 
     def name(self) -> str:
         return f"{type(self).__name__}({self.args[0].name()}, {self.p})"
