@@ -260,3 +260,20 @@ class Constant(Leaf):
             self._nsd_test = eig_util.is_psd_within_tol(-self.value, s.EIGVAL_TOL)
 
         return self._nsd_test
+
+    def get_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return bounds for this constant.
+
+        For constants, the bounds are exactly (value, value).
+
+        Returns
+        -------
+        tuple of np.ndarray
+            (lower_bound, upper_bound) arrays equal to the constant's value.
+        """
+        # Convert sparse matrices to dense for bounds
+        if sp.issparse(self._value):
+            val = self._value.toarray()
+        else:
+            val = self._value
+        return (val.copy(), val.copy())
