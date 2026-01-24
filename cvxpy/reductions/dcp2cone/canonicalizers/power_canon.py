@@ -93,6 +93,9 @@ def power_canon_cone(expr, args):
     if p == 0:
         return ones, []
 
+    # expr.w is a tuple (alpha, 1-alpha). powcone_constrs passes the weight
+    # directly to PowCone3D which only needs alpha (the first element),
+    # unlike gm_constrs which needs the full tuple for dyad_completion.
     w = expr.w[0]
     t = Variable(shape)
 

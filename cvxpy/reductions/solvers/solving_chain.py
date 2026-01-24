@@ -7,6 +7,9 @@ import scipy.sparse as sp
 
 import cvxpy.settings as s
 from cvxpy.atoms import PSD_ATOMS, SOC_ATOMS
+from cvxpy.atoms.elementwise.power import power
+from cvxpy.atoms.geo_mean import geo_mean
+from cvxpy.atoms.pnorm import Pnorm
 from cvxpy.constraints import (
     PSD,
     SOC,
@@ -327,10 +330,9 @@ def construct_solving_chain(problem, candidates,
         if getattr(atom, '_approx', True):
             continue  # Using SOC approximation, no power cones
         # Check atom type to determine which power cone it produces
-        atom_name = type(atom).__name__
-        if atom_name == 'geo_mean':
+        if isinstance(atom, geo_mean):
             has_pow_nd = True
-        elif atom_name in ('power', 'Pnorm'):
+        elif isinstance(atom, (power, Pnorm)):
             has_pow_3d = True
 
     # Check for QuadApprox cones

@@ -602,3 +602,370 @@ class TestExotic2CommonPowerCones(BaseTest):
 
         prob.solve(solver=cp.SCS, eps=1e-5)
         np.testing.assert_allclose(x.value, [1, 1, 1], rtol=1e-2)
+
+    def test_pow3d_to_soc_dual_recovery(self) -> None:
+        """Test that dual variables are properly recovered when pow_3d_canon is used.
+
+        This test directly applies the Exotic2Common reduction to convert
+        PowCone3D to SOC constraints, then solves and verifies that:
+        1. The problem solves correctly
+        2. Primal variables are properly recovered
+        3. The dual value for the power cone constraint is in the inverted solution
+        """
+        from cvxpy.constraints.power import PowCone3D
+        from cvxpy.reductions.cone2cone.exotic2common import Exotic2Common
+        from cvxpy.reductions.solution import Solution
+
+        # Create a simple problem with PowCone3D constraint
+        # max t s.t. x^0.5 * y^0.5 >= t, x + y == 2, x, y >= 0
+        x = cp.Variable(pos=True)
+        y = cp.Variable(pos=True)
+        t = cp.Variable()
+
+        # PowCone3D: x^alpha * y^(1-alpha) >= |t|
+        # With alpha=0.5: sqrt(x*y) >= |t|
+        pow_con = PowCone3D(x, y, t, 0.5)
+        eq_con = x + y == 2
+
+        prob = cp.Problem(cp.Maximize(t), [pow_con, eq_con, x >= 0.1, y >= 0.1])
+
+        # Apply Exotic2Common reduction manually to convert PowCone3D to SOC
+        reduction = Exotic2Common(prob)
+        reduced_prob, inv_data = reduction.apply(prob)
+
+        # Solve the reduced problem
+        reduced_prob.solve(solver=cp.CLARABEL)
+
+        self.assertIn(reduced_prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+
+        # Create solution object and invert the reduction
+        sol = Solution(
+            reduced_prob.status,
+            reduced_prob.value,
+            {v.id: v.value for v in reduced_prob.variables()},
+            {c.id: c.dual_value for c in reduced_prob.constraints},
+            {}
+        )
+        inverted_sol = reduction.invert(sol, inv_data)
+
+        # Verify primal variables are properly recovered
+        self.assertIsNotNone(inverted_sol.primal_vars.get(x.id))
+        self.assertIsNotNone(inverted_sol.primal_vars.get(y.id))
+        self.assertIsNotNone(inverted_sol.primal_vars.get(t.id))
+
+        # Verify primal solution: at optimum x=y=1, t=1 (since sqrt(1*1)=1)
+        self.assertAlmostEqual(inverted_sol.primal_vars[x.id], 1.0, places=2)
+        self.assertAlmostEqual(inverted_sol.primal_vars[y.id], 1.0, places=2)
+        self.assertAlmostEqual(inverted_sol.primal_vars[t.id], 1.0, places=2)
+
+        # Verify dual variables are in the inverted solution
+        self.assertIn(pow_con.id, inverted_sol.dual_vars,
+                      "Dual for PowCone3D should be in inverted solution")
+        self.assertIsNotNone(inverted_sol.dual_vars[pow_con.id],
+                             "Dual value for PowCone3D should not be None")
+
+        # Check the dual value can be converted to expected format [dual_x, dual_y, dual_t]
+        dual_val = inverted_sol.dual_vars[pow_con.id]
+        # The dual from SOC is in [t, X] format, verify it exists
+        self.assertIsNotNone(dual_val)
+
+    def test_pow3d_to_soc_dual_recovery_vector(self) -> None:
+        """Test dual recovery for vector PowCone3D constraints with SOC conversion."""
+        from cvxpy.constraints.power import PowCone3D
+        from cvxpy.reductions.cone2cone.exotic2common import Exotic2Common
+        from cvxpy.reductions.solution import Solution
+
+        # Vector problem with PowCone3D
+        n = 3
+        x = cp.Variable(n, pos=True)
+        y = cp.Variable(n, pos=True)
+        t = cp.Variable(n)
+
+        # PowCone3D for each element: x_i^0.5 * y_i^0.5 >= |t_i|
+        pow_con = PowCone3D(x, y, t, 0.5)
+        sum_con = cp.sum(x) + cp.sum(y) == 6
+
+        prob = cp.Problem(cp.Maximize(cp.sum(t)), [pow_con, sum_con, x >= 0.1, y >= 0.1])
+
+        # Apply Exotic2Common reduction manually
+        reduction = Exotic2Common(prob)
+        reduced_prob, inv_data = reduction.apply(prob)
+
+        # Solve the reduced problem
+        reduced_prob.solve(solver=cp.CLARABEL)
+
+        self.assertIn(reduced_prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+
+        # Create solution object and invert
+        sol = Solution(
+            reduced_prob.status,
+            reduced_prob.value,
+            {v.id: v.value for v in reduced_prob.variables()},
+            {c.id: c.dual_value for c in reduced_prob.constraints},
+            {}
+        )
+        inverted_sol = reduction.invert(sol, inv_data)
+
+        # At optimum, x_i = y_i = 1 for all i, t_i = 1 for all i
+        np.testing.assert_allclose(inverted_sol.primal_vars[x.id], np.ones(n), rtol=0.1)
+        np.testing.assert_allclose(inverted_sol.primal_vars[y.id], np.ones(n), rtol=0.1)
+        np.testing.assert_allclose(inverted_sol.primal_vars[t.id], np.ones(n), rtol=0.1)
+
+        # Verify dual variable is in the inverted solution
+        self.assertIn(pow_con.id, inverted_sol.dual_vars,
+                      "Dual for PowCone3D should be in inverted solution")
+        self.assertIsNotNone(inverted_sol.dual_vars[pow_con.id],
+                             "Dual value for vector PowCone3D should not be None")
+
+    def test_pow3d_to_soc_non_half_alpha(self) -> None:
+        """Test dual recovery for PowCone3D with non-0.5 alpha."""
+        from cvxpy.constraints.power import PowCone3D
+        from cvxpy.reductions.cone2cone.exotic2common import Exotic2Common
+        from cvxpy.reductions.solution import Solution
+
+        # Problem where power cone is tight at optimum
+        x = cp.Variable(pos=True)
+        y = cp.Variable(pos=True)
+        t = cp.Variable()
+
+        pow_con = PowCone3D(x, y, t, 0.3)  # x^0.3 * y^0.7 >= |t|
+        eq_con = x + y == 2
+
+        prob = cp.Problem(cp.Maximize(t), [pow_con, eq_con, x >= 0.1, y >= 0.1])
+
+        # Apply Exotic2Common reduction manually
+        reduction = Exotic2Common(prob)
+        reduced_prob, inv_data = reduction.apply(prob)
+
+        # Solve the reduced problem
+        reduced_prob.solve(solver=cp.CLARABEL)
+
+        self.assertIn(reduced_prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+
+        # Create solution object and invert
+        sol = Solution(
+            reduced_prob.status,
+            reduced_prob.value,
+            {v.id: v.value for v in reduced_prob.variables()},
+            {c.id: c.dual_value for c in reduced_prob.constraints},
+            {}
+        )
+        inverted_sol = reduction.invert(sol, inv_data)
+
+        # Verify primal is recovered
+        self.assertIsNotNone(inverted_sol.primal_vars.get(x.id))
+        self.assertIsNotNone(inverted_sol.primal_vars.get(y.id))
+        self.assertIsNotNone(inverted_sol.primal_vars.get(t.id))
+
+        # Verify dual is in the inverted solution
+        self.assertIn(pow_con.id, inverted_sol.dual_vars,
+                      "Dual for PowCone3D should be in inverted solution")
+        self.assertIsNotNone(inverted_sol.dual_vars[pow_con.id],
+                             "Dual value for PowCone3D should not be None")
+
+
+class TestPowerAtomDPP(BaseTest):
+    """DPP tests for power-related atoms with approx=False."""
+
+    def test_power_approx_false_dpp(self) -> None:
+        """Test that power(approx=False) works with DPP (parameterized problems)."""
+        x = cp.Variable(pos=True)
+        b = cp.Parameter(pos=True)
+
+        # Minimize x^2 subject to x >= b
+        # With approx=False, this uses power cones
+        prob = cp.Problem(
+            cp.Minimize(cp.power(x, 2, approx=False)),
+            [x >= b]
+        )
+
+        # First solve
+        b.value = 2.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value, 2.0, places=3)
+        self.assertAlmostEqual(prob.value, 4.0, places=3)
+
+        # Re-solve with different parameter - should reuse chain
+        b.value = 3.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value, 3.0, places=3)
+        self.assertAlmostEqual(prob.value, 9.0, places=3)
+
+    def test_power_approx_false_dpp_fractional_exponent(self) -> None:
+        """Test power(approx=False) with fractional exponent and DPP."""
+        x = cp.Variable(pos=True)
+        c = cp.Parameter(pos=True)
+
+        # Maximize x^0.5 subject to x <= c
+        prob = cp.Problem(
+            cp.Maximize(cp.power(x, 0.5, approx=False)),
+            [x <= c]
+        )
+
+        # First solve
+        c.value = 4.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value, 4.0, places=3)
+        self.assertAlmostEqual(prob.value, 2.0, places=3)
+
+        # Re-solve with different parameter
+        c.value = 9.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value, 9.0, places=3)
+        self.assertAlmostEqual(prob.value, 3.0, places=3)
+
+    def test_geo_mean_approx_false_dpp(self) -> None:
+        """Test that geo_mean(approx=False) works with DPP."""
+        x = cp.Variable(3, pos=True)
+        budget = cp.Parameter(pos=True)
+
+        # Maximize geometric mean subject to sum(x) <= budget
+        prob = cp.Problem(
+            cp.Maximize(cp.geo_mean(x, approx=False)),
+            [cp.sum(x) <= budget]
+        )
+
+        # First solve - optimal is x = [budget/3, budget/3, budget/3]
+        budget.value = 3.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        np.testing.assert_allclose(x.value, np.ones(3), rtol=0.01)
+        self.assertAlmostEqual(prob.value, 1.0, places=3)
+
+        # Re-solve with different budget
+        budget.value = 6.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        np.testing.assert_allclose(x.value, 2.0 * np.ones(3), rtol=0.01)
+        self.assertAlmostEqual(prob.value, 2.0, places=3)
+
+    def test_geo_mean_approx_false_weighted_dpp(self) -> None:
+        """Test weighted geo_mean(approx=False) with DPP."""
+        x = cp.Variable(2, pos=True)
+        budget = cp.Parameter(pos=True)
+
+        # Weighted geometric mean: x[0]^(1/3) * x[1]^(2/3)
+        prob = cp.Problem(
+            cp.Maximize(cp.geo_mean(x, [1, 2], approx=False)),
+            [cp.sum(x) <= budget]
+        )
+
+        # First solve
+        budget.value = 3.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        # Optimal allocation: x[0] = budget/3, x[1] = 2*budget/3
+        self.assertAlmostEqual(x.value[0], 1.0, places=2)
+        self.assertAlmostEqual(x.value[1], 2.0, places=2)
+
+        # Re-solve with different budget
+        budget.value = 6.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value[0], 2.0, places=2)
+        self.assertAlmostEqual(x.value[1], 4.0, places=2)
+
+    def test_pnorm_approx_false_dpp(self) -> None:
+        """Test that pnorm(approx=False) works with DPP."""
+        x = cp.Variable(3)
+        target = cp.Parameter(3)
+
+        # Minimize p-norm distance to target
+        prob = cp.Problem(
+            cp.Minimize(cp.pnorm(x - target, p=3, approx=False)),
+            [cp.sum(x) == 3]
+        )
+
+        # First solve - target at origin
+        target.value = np.zeros(3)
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        # With sum(x) = 3 and minimizing 3-norm, optimal is x = [1, 1, 1]
+        np.testing.assert_allclose(x.value, np.ones(3), rtol=0.01)
+
+        # Re-solve with different target
+        target.value = np.array([1.0, 1.0, 1.0])
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        # Optimal is still x = [1, 1, 1] which equals target
+        np.testing.assert_allclose(x.value, np.ones(3), rtol=0.01)
+        self.assertAlmostEqual(prob.value, 0.0, places=3)
+
+    def test_pnorm_approx_false_dpp_fractional_p(self) -> None:
+        """Test pnorm(approx=False) with fractional p and DPP."""
+        x = cp.Variable(2, pos=True)
+        lower = cp.Parameter(2, pos=True)
+
+        # Minimize 2.5-norm subject to lower bounds
+        prob = cp.Problem(
+            cp.Minimize(cp.pnorm(x, p=2.5, approx=False)),
+            [x >= lower]
+        )
+
+        # First solve
+        lower.value = np.array([1.0, 2.0])
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        np.testing.assert_allclose(x.value, lower.value, rtol=0.01)
+
+        # Re-solve with different lower bounds
+        lower.value = np.array([2.0, 3.0])
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        np.testing.assert_allclose(x.value, lower.value, rtol=0.01)
+
+    def test_mixed_power_geo_mean_dpp(self) -> None:
+        """Test problem with both power and geo_mean (approx=False) with DPP."""
+        x = cp.Variable(2, pos=True)
+        y = cp.Variable(pos=True)
+        budget = cp.Parameter(pos=True)
+
+        # Maximize geo_mean(x) + sqrt(y) subject to sum(x) + y <= budget
+        prob = cp.Problem(
+            cp.Maximize(cp.geo_mean(x, approx=False) + cp.power(y, 0.5, approx=False)),
+            [cp.sum(x) + y <= budget]
+        )
+
+        # First solve
+        budget.value = 4.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        val1 = prob.value
+
+        # Re-solve with different budget
+        budget.value = 8.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        val2 = prob.value
+
+        # Value should increase with larger budget
+        self.assertGreater(val2, val1)
+
+    def test_power_approx_false_objective_param(self) -> None:
+        """Test power(approx=False) with parameter in objective coefficient."""
+        x = cp.Variable(pos=True)
+        coeff = cp.Parameter(pos=True)
+
+        # Minimize coeff * x^2 subject to x >= 1
+        prob = cp.Problem(
+            cp.Minimize(coeff * cp.power(x, 2, approx=False)),
+            [x >= 1]
+        )
+
+        # First solve
+        coeff.value = 1.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value, 1.0, places=3)
+        self.assertAlmostEqual(prob.value, 1.0, places=3)
+
+        # Re-solve with different coefficient
+        coeff.value = 2.0
+        prob.solve(solver=cp.CLARABEL)
+        self.assertIn(prob.status, [cp.OPTIMAL, cp.OPTIMAL_INACCURATE])
+        self.assertAlmostEqual(x.value, 1.0, places=3)
+        self.assertAlmostEqual(prob.value, 2.0, places=3)
